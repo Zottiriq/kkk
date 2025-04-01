@@ -1,38 +1,97 @@
 import scapy.all as scapy
+from scapy.all import IP, TCP, UDP, ICMP
 from collections import defaultdict
 import time
 import threading
-import os
 import subprocess
+import os
 
-class ddos_preventer:
+class DDoSPreventer:
     def __init__(self):
-        self.request_limit = 100
-        self.check_interval = 10
-        self.ip_counter = defaultdict(int)
-    
+        self.request_limit = 100  # Maximum allowed requests per IP
+        self.check_interval = 10  # Time interval for checking traffic (in seconds)
+        self.ip_counter = defaultdict(int)  # Dictionary to count requests per IP
+        self.whitelist = {"192.168.1.1", "8.8.8.8"}  # List of trusted IPs that won't be blocked
+        self.blacklist = []  # To track blocked IPs
+        self.blocked_ips_file = "blocked_ips.txt"  # File to store blocked IPs
+
+        # Reload previously blocked IPs from file
+        self.reload_blocked_ips()
+
+        # Start the background monitoring thread
+        self.monitor_thread = threading.Thread(target=self.request_counter, daemon=True)
+        self.monitor_thread.start()
+
+    def reload_blocked_ips(self):
+        """Reload previously blocked IPs from the file and reapply iptables rules."""
+        if os.path.exists(self.blocked_ips_file):
+            with open(self.blocked_ips_file, "r") as file:
+                for line in file:
+                    ip = line.strip()
+                    if ip:
+                        self.block_ip(ip, log=False)  # Reapply iptables rule without logging
+            print("[*] Reloaded blocked IPs from file.")
+
+    def save_blocked_ip(self, ip):
+        """Save a blocked IP to the file."""
+        with open(self.blocked_ips_file, "a") as file:
+            file.write(f"{ip}\n")
+
     def packet_catch(self, packet):
+        """Capture network packets and count requests from each IP."""
         if packet.haslayer(IP):
             ip_source = packet[IP].src
+            
+            if packet.haslayer(TCP):
+                print(f"[TCP] Paket alındı: {ip_source}")
+            elif packet.haslayer(UDP):
+                print(f"[UDP] Paket alındı: {ip_source}")
+            elif packet.haslayer(ICMP):
+                print(f"[ICMP] Paket alındı: {ip_source}")
+
+            if ip_source in self.blacklist:
+                return
+            # Skip counting for whitelisted IPs
+            if ip_source in self.whitelist:
+                return  
+
             self.ip_counter[ip_source] += 1
-    
-    def block_ip(ip):
-        print(f"ip: {ip} is blocking")
 
+    def log_event(self, ip, count):
+        """Log blocked IPs and their request counts."""
+        with open("ddos_logfile.txt", "a") as log_file:
+            log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Blocked IP: {ip}, Requests: {count}\n")
+
+    def block_ip(self, ip, log=True):
+        """Block the specified IP using iptables."""
+        print(f"[*] Blocking IP: {ip}")
         try:
-            command = (["iptables", "-A", "INPUT", "-s", ip "-j", "DROP"], check=True)
-            subprocess.run(command)
-        except subprocess.CalledProcessError as a:
-            print(f"[ERROR] failed to block {ip}: {e}")
-
+            command = ["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"]
+            subprocess.run(command, check=True)
+            print(f"[+] Successfully blocked {ip}")
+            if log:
+                self.save_blocked_ip(ip)  # Save to persistent storage
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to block {ip}: {e}")
 
     def request_counter(self):
+        """Check request counts at regular intervals and block IPs exceeding the limit."""
         while True:
             time.sleep(self.check_interval)
-            print("\nChecking traffic...")
+            print("\n[*] Checking traffic...")
             for ip, count in list(self.ip_counter.items()):
                 if count > self.request_limit:
-                    block_ip(ip)
-                    print(f"ip: {ip} has been blocked\ndue to request limit reached {count}")
-            self.ip_counter.clear()
-        
+                    self.block_ip(ip)
+                    self.log_event(ip, count)  # Log the blocked IP
+                    self.blacklist.append(ip)
+                    print(f"[!] IP {ip} blocked - Exceeded request limit: {count}")
+            self.ip_counter.clear()  # Reset the request counters
+
+# **Start network sniffing**
+ddos = DDoSPreventer()
+print("[*] DDoS preventer is running...")
+
+try:
+    scapy.sniff(prn=ddos.packet_catch, store=False)
+except Exception as e:
+    print(f"[ERROR] An error occurred while sniffing: {e}")
